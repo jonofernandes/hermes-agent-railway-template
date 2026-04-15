@@ -236,10 +236,15 @@ class WebManager:
             env = os.environ.copy()
             env["HERMES_HOME"] = HERMES_HOME
 
+            # Call start_server() directly to bypass the `hermes dashboard`
+            # CLI wrapper which runs _build_web_ui() and requires Node.js.
+            # Node is only available in the Docker build stage, not at runtime.
             self.process = await asyncio.create_subprocess_exec(
-                "hermes", "dashboard",
-                "--port", str(WEB_PORT),
-                "--no-open",
+                "python", "-c",
+                (
+                    "from hermes_cli.web_server import start_server; "
+                    f"start_server(port={WEB_PORT}, open_browser=False)"
+                ),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
