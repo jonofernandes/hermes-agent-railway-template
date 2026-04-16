@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hermes Agent</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    input:focus { outline: none; }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen text-gray-900" x-data="app()" x-init="init()" x-cloak>
+
+  <!-- Header -->
+  <header class="bg-gray-900 text-white px-6 py-3 flex items-center gap-3 sticky top-0 z-10">
+    <span class="text-lg font-semibold tracking-tight">Hermes Agent</span>
+    <span class="px-2 py-0.5 rounded text-xs font-medium"
+          :class="{
+            'bg-green-500': status?.gateway?.state === 'running',
+            'bg-yellow-500': status?.gateway?.state === 'starting' || status?.gateway?.state === 'stopping',
+            'bg-red-500':   status?.gateway?.state === 'error',
+            'bg-gray-500':  !status?.gateway?.state || status?.gateway?.state === 'stopped'
+          }"
+          x-text="status?.gateway?.state ?? 'unknown'"></span>
+    <span class="text-xs text-gray-400" x-show="status?.gateway?.uptime != null">
+      up <span x-text="fmtUptime(status.gateway.uptime)"></span>
+    </span>
+    <div class="ml-auto flex gap-2">
+      <button @click="gwAction('start')"   class="px-3 py-1 bg-green-600 hover:bg-green-700 rounded text-sm">Start</button>
+      <button @click="gwAction('restart')" class="px-3 py-1 bg-yellow-600 hover:bg-yellow-700 rounded text-sm">Restart</button>
+      <button @click="gwAction('stop')"    class="px-3 py-1 bg-red-700 hover:bg-red-800 rounded text-sm">Stop</button>
+    </div>
+  </header>
+
+  <main class="max-w-4xl mx-auto px-6 py-8 space-y-10">
+
+    <!-- Status cards -->
+    <section>
+      <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">Status</h2>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+
+        <div class="bg-white border rounded-lg p-4">
+          <p class="text-xs font-medium text-gray-500 mb-3">Providers</p>
+          <template x-for="[key, active] in Object.entries(status?.providers ?? {})" :key="key">
+            <div class="flex items-center justify-between py-1 text-sm">
+              <span class="font-mono text-xs text-gray-700" x-text="key"></span>
+              <span :class="active ? 'text-green-600' : 'text-gray-300'" x-text="active ? '● on' : '○ off'"></span>
+            </div>
+          </template>
+        </div>
+
+        <div class="bg-white border rounded-lg p-4">
+          <p class="text-xs font-medium text-gray-500 mb-3">Channels</p>
+          <template x-for="[name, active] in Object.entries(status?.channels ?? {})" :key="name">
+            <div class="flex items-center justify-between py-1 text-sm">
+              <span x-text="name"></span>
+              <span :class="active ? 'text-green-600' : 'text-gray-300'" x-text="active ? '● on' : '○ off'"></span>
+            </div>
+          </template>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- Config editor -->
+    <section>
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide">Configuration</h2>
+        <div class="flex items-center gap-2">
+          <button @click="addEntry()" class="px-3 py-1 border rounded text-sm hover:bg-gray-50">+ Add</button>
+          <button @click="saveConfig()"
+                  class="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm disabled:opacity-50"
+                  :disabled="saving">
+            <span x-text="saving ? 'Saving…' : 'Save'"></span>
+          </button>
+        </div>
+      </div>
+
+      <div x-show="saveMsg" x-text="saveMsg"
+           class="mb-3 px-3 py-2 bg-green-50 border border-green-200 text-green-700 rounded text-sm"></div>
+
+      <div class="bg-white border rounded-lg divide-y">
+        <template x-for="(row, idx) in entries" :key="idx">
+          <div class="flex items-center gap-2 px-4 py-2">
+            <input type="text"
+                   x-model="row.key"
+                   class="w-56 text-xs font-mono bg-transparent border-0 focus:ring-0 text-gray-700 placeholder-gray-300"
+                   placeholder="VARIABLE_NAME">
+            <span class="text-gray-300 select-none">=</span>
+            <input :type="isSecret(row.key) ? 'password' : 'text'"
+                   x-model="row.value"
+                   class="flex-1 text-xs font-mono bg-transparent border-0 focus:ring-0 placeholder-gray-300"
+                   placeholder="value">
+            <button @click="entries.splice(idx, 1)"
+                    class="text-gray-300 hover:text-red-400 text-sm leading-none px-1">✕</button>
+          </div>
+        </template>
+        <div x-show="entries.length === 0" class="px-4 py-6 text-sm text-gray-400 text-center">
+          No config yet. Click "+ Add" to add a key.
+        </div>
+      </div>
+    </section>
+
+    <!-- Pairing -->
+    <section x-show="pending.length > 0">
+      <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">Pending Pairing Requests</h2>
+      <div class="bg-white border rounded-lg divide-y">
+        <template x-for="req in pending" :key="req.platform + req.code">
+          <div class="flex items-center gap-4 px-4 py-3 text-sm">
+            <span class="font-medium capitalize" x-text="req.platform"></span>
+            <span class="font-mono text-gray-700" x-text="req.code"></span>
+            <span class="text-gray-500" x-text="req.user_name || req.user_id"></span>
+            <span class="text-xs text-gray-400" x-text="req.age_minutes + 'm ago'"></span>
+            <div class="ml-auto flex gap-2">
+              <button @click="pairingApprove(req)"
+                      class="px-2 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-xs">Approve</button>
+              <button @click="pairingDeny(req)"
+                      class="px-2 py-1 bg-red-600 hover:bg-red-700 text-white rounded text-xs">Deny</button>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- Logs -->
+    <section>
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide">Gateway Logs</h2>
+        <label class="flex items-center gap-2 text-xs text-gray-500 cursor-pointer select-none">
+          <input type="checkbox" x-model="autoRefresh" class="rounded">
+          Auto-refresh
+        </label>
+      </div>
+      <div id="log-box"
+           class="bg-gray-950 text-green-400 font-mono text-xs rounded-lg p-4 h-72 overflow-y-auto">
+        <template x-for="(line, i) in logs" :key="i">
+          <div x-text="line" class="leading-5 whitespace-pre-wrap break-all"></div>
+        </template>
+        <div x-show="logs.length === 0" class="text-gray-600">No gateway logs yet.</div>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    function app() {
+      return {
+        entries: [],
+        status: null,
+        logs: [],
+        pending: [],
+        saving: false,
+        saveMsg: '',
+        autoRefresh: true,
+        _timer: null,
+
+        async init() {
+          await Promise.all([this.loadConfig(), this.loadStatus(), this.loadLogs(), this.loadPending()]);
+          this._timer = setInterval(() => {
+            if (!this.autoRefresh) return;
+            this.loadStatus();
+            this.loadLogs();
+            this.loadPending();
+          }, 3000);
+        },
+
+        async loadConfig() {
+          const r = await fetch('/api/config');
+          const cfg = await r.json();
+          this.entries = Object.entries(cfg).map(([key, value]) => ({ key, value }));
+        },
+
+        async saveConfig() {
+          this.saving = true;
+          this.saveMsg = '';
+          const data = {};
+          for (const { key, value } of this.entries) {
+            if (key.trim()) data[key.trim()] = value ?? '';
+          }
+          const r = await fetch('/api/config', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),
+          });
+          const result = await r.json();
+          this.saving = false;
+          if (result.ok) {
+            this.saveMsg = 'Saved successfully.';
+            await this.loadConfig();
+            await this.loadStatus();
+            setTimeout(() => { this.saveMsg = ''; }, 4000);
+          }
+        },
+
+        addEntry() {
+          this.entries.push({ key: '', value: '' });
+        },
+
+        isSecret(key) {
+          return /key|token|password|secret/i.test(key || '');
+        },
+
+        async loadStatus() {
+          const r = await fetch('/api/status');
+          this.status = await r.json();
+        },
+
+        async loadLogs() {
+          const r = await fetch('/api/logs');
+          const data = await r.json();
+          this.logs = data.logs ?? [];
+          this.$nextTick(() => {
+            const el = document.getElementById('log-box');
+            if (el) el.scrollTop = el.scrollHeight;
+          });
+        },
+
+        async loadPending() {
+          const r = await fetch('/api/pairing/pending');
+          const data = await r.json();
+          this.pending = data.pending ?? [];
+        },
+
+        async pairingApprove(req) {
+          await fetch('/api/pairing/approve', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ platform: req.platform, code: req.code }),
+          });
+          await this.loadPending();
+        },
+
+        async pairingDeny(req) {
+          await fetch('/api/pairing/deny', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ platform: req.platform, code: req.code }),
+          });
+          await this.loadPending();
+        },
+
+        async gwAction(action) {
+          await fetch(`/api/gateway/${action}`, { method: 'POST' });
+          setTimeout(() => this.loadStatus(), 800);
+          setTimeout(() => this.loadStatus(), 2500);
+        },
+
+        fmtUptime(secs) {
+          if (secs == null) return '';
+          if (secs < 60) return secs + 's';
+          if (secs < 3600) return Math.floor(secs / 60) + 'm';
+          return Math.floor(secs / 3600) + 'h ' + Math.floor((secs % 3600) / 60) + 'm';
+        },
+      };
+    }
+  </script>
+</body>
+</html>

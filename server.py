@@ -12,12 +12,10 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import httpx
 from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
 from starlette.applications import Starlette
-from starlette.middleware import Middleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
@@ -30,18 +28,15 @@ if not ADMIN_PASSWORD:
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE_PATH = Path(HERMES_HOME) / ".env"
 PAIRING_DIR = Path(HERMES_HOME) / "pairing"
+TEMPLATE_PATH = Path(__file__).parent / "templates" / "index.html"
 CODE_TTL_SECONDS = 3600
 
-WEB_PORT = 9119
-WEB_BASE_URL = f"http://127.0.0.1:{WEB_PORT}"
-
-# Session cookie signing — stable across restarts so long as ADMIN_PASSWORD is set
 _COOKIE_NAME = "hermes_session"
 _SIGNER = TimestampSigner(
     hashlib.sha256(ADMIN_PASSWORD.encode()).hexdigest(),
     salt="hermes-railway",
 )
-_SESSION_MAX_AGE = 86400 * 7  # 7 days
+_SESSION_MAX_AGE = 86400 * 7
 
 PROVIDER_KEYS = [
     "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY",
@@ -57,11 +52,12 @@ CHANNEL_KEYS = {
     "Matrix": "MATRIX_ACCESS_TOKEN",
 }
 
+SECRET_PATTERN = re.compile(r"(KEY|TOKEN|PASSWORD|SECRET)", re.IGNORECASE)
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 # ---------------------------------------------------------------------------
-# .env helpers (still needed for gateway auto-start and pairing)
+# .env helpers
 # ---------------------------------------------------------------------------
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -81,6 +77,30 @@ def read_env_file(path: Path) -> dict[str, str]:
             value = value[1:-1]
         result[key] = value
     return result
+
+
+def write_env_file(path: Path, data: dict[str, str]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for k, v in data.items():
+        if v:
+            escaped = v.replace('"', '\\"')
+            lines.append(f'{k}="{escaped}"')
+    path.write_text("\n".join(lines) + ("\n" if lines else ""))
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def mask_value(key: str, value: str) -> str:
+    if SECRET_PATTERN.search(key) and value:
+        return (value[:8] + "***") if len(value) > 8 else "***"
+    return value
+
+
+def _is_masked(value: str) -> bool:
+    return value.endswith("***")
 
 
 # ---------------------------------------------------------------------------
@@ -107,12 +127,9 @@ def _validate_session_cookie(value: str) -> bool:
 
 
 def _is_authenticated(request: Request) -> bool:
-    # 1. Valid session cookie
     cookie = request.cookies.get(_COOKIE_NAME)
     if cookie and _validate_session_cookie(cookie):
         return True
-
-    # 2. HTTP Basic auth
     auth = request.headers.get("Authorization", "")
     if auth.lower().startswith("basic "):
         try:
@@ -122,16 +139,27 @@ def _is_authenticated(request: Request) -> bool:
                 return True
         except Exception:
             pass
-
     return False
 
 
-def _auth_response() -> Response:
+def _auth_response():
     return PlainTextResponse(
         "Unauthorized",
         status_code=401,
         headers={"WWW-Authenticate": 'Basic realm="hermes"'},
     )
+
+
+def _set_session_cookie(request: Request, response):
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("basic ") and not request.cookies.get(_COOKIE_NAME):
+        response.set_cookie(
+            _COOKIE_NAME,
+            _make_session_cookie(),
+            max_age=_SESSION_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +182,7 @@ class GatewayManager:
         try:
             env = os.environ.copy()
             env["HERMES_HOME"] = HERMES_HOME
-            env_vars = read_env_file(ENV_FILE_PATH)
-            env.update(env_vars)
+            env.update(read_env_file(ENV_FILE_PATH))
 
             self.process = await asyncio.create_subprocess_exec(
                 "hermes", "gateway",
@@ -220,147 +247,7 @@ class GatewayManager:
         }
 
 
-# ---------------------------------------------------------------------------
-# Web UI manager (hermes web)
-# ---------------------------------------------------------------------------
-
-class WebManager:
-    def __init__(self):
-        self.process: asyncio.subprocess.Process | None = None
-        self._read_task: asyncio.Task | None = None
-        self._output_lines: list[str] = []
-
-    async def start(self):
-        if self.process and self.process.returncode is None:
-            return
-        self._output_lines = []
-        try:
-            env = os.environ.copy()
-            env["HERMES_HOME"] = HERMES_HOME
-            env.update(read_env_file(ENV_FILE_PATH))
-
-            self.process = await asyncio.create_subprocess_exec(
-                "hermes", "web",
-                "--port", str(WEB_PORT),
-                "--no-open",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=env,
-            )
-            self._read_task = asyncio.create_task(self._drain_output())
-        except Exception as e:
-            print(f"Failed to start hermes web: {e}", flush=True)
-
-    async def stop(self):
-        if not self.process or self.process.returncode is not None:
-            return
-        self.process.terminate()
-        try:
-            await asyncio.wait_for(self.process.wait(), timeout=10)
-        except asyncio.TimeoutError:
-            self.process.kill()
-            await self.process.wait()
-
-    async def _drain_output(self):
-        try:
-            while self.process and self.process.stdout:
-                line = await self.process.stdout.readline()
-                if not line:
-                    break
-                decoded = line.decode("utf-8", errors="replace").rstrip()
-                self._output_lines.append(decoded)
-                print(f"[hermes web] {decoded}", flush=True)
-        except asyncio.CancelledError:
-            return
-        if self.process and self.process.returncode is not None:
-            print(f"[hermes web] exited with code {self.process.returncode}", flush=True)
-
-    async def wait_ready(self, timeout: float = 30.0) -> bool:
-        """Poll WEB_PORT until hermes web is accepting TCP connections."""
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout
-        print(f"[hermes web] waiting for port {WEB_PORT}…", flush=True)
-        while loop.time() < deadline:
-            if self.process and self.process.returncode is not None:
-                # Yield to let _drain_output flush remaining lines before reporting
-                await asyncio.sleep(0.2)
-                print("[hermes web] process exited before becoming ready", flush=True)
-                if self._output_lines:
-                    print("[hermes web] --- startup output ---", flush=True)
-                    for ln in self._output_lines:
-                        print(f"[hermes web] {ln}", flush=True)
-                    print("[hermes web] --- end output ---", flush=True)
-                return False
-            try:
-                _, writer = await asyncio.wait_for(
-                    asyncio.open_connection("127.0.0.1", WEB_PORT), timeout=1.0
-                )
-                writer.close()
-                await writer.wait_closed()
-                print(f"[hermes web] ready on port {WEB_PORT}", flush=True)
-                return True
-            except (OSError, asyncio.TimeoutError):
-                await asyncio.sleep(1)
-        print(f"[hermes web] timed out waiting for port {WEB_PORT}", flush=True)
-        return False
-
-
 gateway = GatewayManager()
-web_manager = WebManager()
-_proxy_client: httpx.AsyncClient | None = None
-
-
-# ---------------------------------------------------------------------------
-# Reverse proxy helpers
-# ---------------------------------------------------------------------------
-
-# Headers that must not be forwarded hop-by-hop
-_HOP_BY_HOP = frozenset([
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade",
-])
-
-
-async def _proxy_request(request: Request) -> Response:
-    """Forward request to the upstream hermes web FastAPI server."""
-    assert _proxy_client is not None
-
-    url = f"{WEB_BASE_URL}{request.url.path}"
-    if request.url.query:
-        url = f"{url}?{request.url.query}"
-
-    # Forward headers, stripping hop-by-hop and host
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in _HOP_BY_HOP and k.lower() != "host"
-    }
-
-    body = await request.body()
-
-    try:
-        upstream = await _proxy_client.request(
-            method=request.method,
-            url=url,
-            headers=headers,
-            content=body,
-            follow_redirects=False,
-        )
-    except httpx.ConnectError:
-        return PlainTextResponse("Hermes web UI is starting, please wait…", status_code=503)
-    except Exception as e:
-        return PlainTextResponse(f"Proxy error: {e}", status_code=502)
-
-    # Strip hop-by-hop from upstream response
-    resp_headers = {
-        k: v for k, v in upstream.headers.items()
-        if k.lower() not in _HOP_BY_HOP
-    }
-
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=resp_headers,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -371,30 +258,76 @@ async def health(request: Request):
     return JSONResponse({"status": "ok", "gateway": gateway.state})
 
 
-async def proxy_handler(request: Request):
-    """Auth gate + reverse proxy for everything going to hermes web."""
+async def index(request: Request):
     if not _is_authenticated(request):
         return _auth_response()
-
-    response = await _proxy_request(request)
-
-    # Set session cookie on successful page loads so the browser doesn't need
-    # to re-send Basic auth credentials on every subsequent request
-    if response.status_code < 400:
-        auth = request.headers.get("Authorization", "")
-        if auth.lower().startswith("basic ") and not request.cookies.get(_COOKIE_NAME):
-            response.set_cookie(
-                _COOKIE_NAME,
-                _make_session_cookie(),
-                max_age=_SESSION_MAX_AGE,
-                httponly=True,
-                samesite="lax",
-            )
-
+    try:
+        content = TEMPLATE_PATH.read_text()
+    except FileNotFoundError:
+        content = "<h1>UI template not found</h1>"
+    response = HTMLResponse(content)
+    _set_session_cookie(request, response)
     return response
 
 
-# Gateway control (not in upstream hermes web)
+async def api_config_get(request: Request):
+    if not _is_authenticated(request):
+        return _auth_response()
+    env = read_env_file(ENV_FILE_PATH)
+    masked = {k: mask_value(k, v) for k, v in env.items()}
+    return JSONResponse(masked)
+
+
+async def api_config_put(request: Request):
+    if not _is_authenticated(request):
+        return _auth_response()
+    try:
+        new_data: dict = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    existing = read_env_file(ENV_FILE_PATH)
+    merged = dict(existing)
+
+    for k, v in new_data.items():
+        if not isinstance(v, str):
+            continue
+        v = v.strip()
+        if not v:
+            merged.pop(k, None)
+        elif _is_masked(v):
+            pass  # preserve existing value
+        else:
+            merged[k] = v
+
+    write_env_file(ENV_FILE_PATH, merged)
+    return JSONResponse({"ok": True})
+
+
+async def api_config(request: Request):
+    if request.method == "GET":
+        return await api_config_get(request)
+    return await api_config_put(request)
+
+
+async def api_status(request: Request):
+    if not _is_authenticated(request):
+        return _auth_response()
+    env = read_env_file(ENV_FILE_PATH)
+    providers = {key: bool(env.get(key)) for key in PROVIDER_KEYS}
+    channels = {name: bool(env.get(key)) for name, key in CHANNEL_KEYS.items()}
+    return JSONResponse({
+        "gateway": gateway.get_status(),
+        "providers": providers,
+        "channels": channels,
+    })
+
+
+async def api_logs(request: Request):
+    if not _is_authenticated(request):
+        return _auth_response()
+    return JSONResponse({"logs": list(gateway.logs)})
+
 
 async def api_gateway_start(request: Request):
     if not _is_authenticated(request):
@@ -417,7 +350,9 @@ async def api_gateway_restart(request: Request):
     return JSONResponse({"ok": True})
 
 
-# Pairing (not in upstream hermes web)
+# ---------------------------------------------------------------------------
+# Pairing
+# ---------------------------------------------------------------------------
 
 def _load_pairing_json(path: Path) -> dict:
     if path.exists():
@@ -576,36 +511,26 @@ async def auto_start_gateway():
 
 routes = [
     Route("/health", health),
-    # Gateway control
+    Route("/", index),
+    Route("/api/config", api_config, methods=["GET", "PUT"]),
+    Route("/api/status", api_status),
+    Route("/api/logs", api_logs),
     Route("/api/gateway/start", api_gateway_start, methods=["POST"]),
     Route("/api/gateway/stop", api_gateway_stop, methods=["POST"]),
     Route("/api/gateway/restart", api_gateway_restart, methods=["POST"]),
-    # Pairing
     Route("/api/pairing/pending", api_pairing_pending),
     Route("/api/pairing/approve", api_pairing_approve, methods=["POST"]),
     Route("/api/pairing/deny", api_pairing_deny, methods=["POST"]),
     Route("/api/pairing/approved", api_pairing_approved),
     Route("/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
-    # Everything else → hermes web (React SPA + upstream API)
-    Route("/{path:path}", proxy_handler, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
-    Route("/", proxy_handler),
 ]
 
 
 @asynccontextmanager
 async def lifespan(app):
-    global _proxy_client
-    _proxy_client = httpx.AsyncClient(timeout=30.0)
-
-    await web_manager.start()
-    await web_manager.wait_ready(timeout=30.0)
     await auto_start_gateway()
-
     yield
-
     await gateway.stop()
-    await web_manager.stop()
-    await _proxy_client.aclose()
 
 
 app = Starlette(
@@ -628,7 +553,6 @@ if __name__ == "__main__":
 
     def handle_signal():
         loop.create_task(gateway.stop())
-        loop.create_task(web_manager.stop())
         server.should_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):
