@@ -228,13 +228,16 @@ class WebManager:
     def __init__(self):
         self.process: asyncio.subprocess.Process | None = None
         self._read_task: asyncio.Task | None = None
+        self._output_lines: list[str] = []
 
     async def start(self):
         if self.process and self.process.returncode is None:
             return
+        self._output_lines = []
         try:
             env = os.environ.copy()
             env["HERMES_HOME"] = HERMES_HOME
+            env.update(read_env_file(ENV_FILE_PATH))
 
             self.process = await asyncio.create_subprocess_exec(
                 "hermes", "web",
@@ -246,7 +249,7 @@ class WebManager:
             )
             self._read_task = asyncio.create_task(self._drain_output())
         except Exception as e:
-            print(f"Failed to start hermes web: {e}")
+            print(f"Failed to start hermes web: {e}", flush=True)
 
     async def stop(self):
         if not self.process or self.process.returncode is not None:
@@ -264,7 +267,9 @@ class WebManager:
                 line = await self.process.stdout.readline()
                 if not line:
                     break
-                print(f"[hermes web] {line.decode('utf-8', errors='replace').rstrip()}", flush=True)
+                decoded = line.decode("utf-8", errors="replace").rstrip()
+                self._output_lines.append(decoded)
+                print(f"[hermes web] {decoded}", flush=True)
         except asyncio.CancelledError:
             return
         if self.process and self.process.returncode is not None:
@@ -277,7 +282,14 @@ class WebManager:
         print(f"[hermes web] waiting for port {WEB_PORT}…", flush=True)
         while loop.time() < deadline:
             if self.process and self.process.returncode is not None:
+                # Yield to let _drain_output flush remaining lines before reporting
+                await asyncio.sleep(0.2)
                 print("[hermes web] process exited before becoming ready", flush=True)
+                if self._output_lines:
+                    print("[hermes web] --- startup output ---", flush=True)
+                    for ln in self._output_lines:
+                        print(f"[hermes web] {ln}", flush=True)
+                    print("[hermes web] --- end output ---", flush=True)
                 return False
             try:
                 _, writer = await asyncio.wait_for(
