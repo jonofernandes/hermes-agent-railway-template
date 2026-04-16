@@ -22,6 +22,11 @@ RUN cd /tmp/hermes-agent && \
 COPY requirements.txt /app/requirements.txt
 RUN uv pip install --system --no-cache -r /app/requirements.txt
 
+# Patch Discord platform: wrap tree.sync() in try/except and truncate descriptions
+# to avoid Discord's 8000-byte command-group limit (CommandSyncFailure HTTP 400)
+COPY patch_discord.py /tmp/patch_discord.py
+RUN python3 /tmp/patch_discord.py
+
 RUN mkdir -p /data/.hermes
 
 COPY server.py /app/server.py

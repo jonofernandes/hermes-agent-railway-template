@@ -235,6 +235,8 @@ class WebManager:
         try:
             env = os.environ.copy()
             env["HERMES_HOME"] = HERMES_HOME
+            env_vars = read_env_file(ENV_FILE_PATH)
+            env.update(env_vars)
 
             self.process = await asyncio.create_subprocess_exec(
                 "hermes", "web",
